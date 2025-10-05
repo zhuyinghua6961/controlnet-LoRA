@@ -1,0 +1,13 @@
+torch>=2.0.0
+torchvision
+torchaudio
+accelerate>=0.21.0
+diffusers>=0.20.0
+transformers>=4.30.0
+safetensors
+xformers
+PyYAML>=5.1
+opencv-python
+scipy
+matplotlib
+Pillow
