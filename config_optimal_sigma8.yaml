@@ -1,0 +1,37 @@
+# 最优Sigma配置 (sigma=8)
+# 同时使用：加权Loss + 降低Sigma
+# 这是针对位置精度的最强组合！
+
+project:
+  name: "radar_controlnet"
+  output_dir: "output/controlnet_optimal"  # 全新模型
+  # TensorBoard日志会自动保存到: output/controlnet_optimal/logs
+  # 启动命令: tensorboard --logdir=output/controlnet_optimal/logs
+
+data:
+  data_dir: "dataset"
+  resolution: 512
+  range_max: 200
+  vel_max: 40
+
+training:
+  train_batch_size: 1
+  gradient_accumulation_steps: 8
+  num_train_epochs: 50                # 完整训练50个epoch
+  learning_rate: 1.5e-5               # 标准学习率
+  lr_scheduler: "cosine"
+  lr_warmup_steps: 1000
+  max_grad_norm: 1.0
+  save_steps: 500
+  mixed_precision: "fp16"
+  dataloader_num_workers: 4
+  
+  # 🔴 关键改进1：加权Loss
+  loss_weight_factor: 100             # 目标区域权重5倍
+  
+  # 🔴 关键改进2：降低Sigma
+  heatmap_sigma: 8.0                  # 从15降到8，减少模糊
+                                      # 影响范围：±24像素 (vs ±45像素)
+                                      # 对应物理距离：±9.4m (vs ±17.6m)
+
+

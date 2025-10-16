@@ -1,0 +1,14 @@
+# 忽略数据集目录
+dataset/
+
+# 忽略输出目录
+output/
+
+heatmap/
+
+__pycache__/
+
+results*/
+
+**/logs/
+*./log

@@ -1,0 +1,33 @@
+project:
+  name: "radar_controlnet_lora"
+  output_dir: "output/controlnet_lora"
+
+data:
+  data_dir: "dataset"
+  resolution: 512
+  range_max: 200
+  vel_max: 40
+
+training:
+  train_batch_size: 2
+  gradient_accumulation_steps: 4
+  num_train_epochs: 5
+  learning_rate: 5.0e-5
+  lr_scheduler: "cosine"
+  lr_warmup_steps: 500
+  max_grad_norm: 1.0
+  save_steps: 2000
+  mixed_precision: "fp16"
+  dataloader_num_workers: 4
+
+  # LoRA & loss 相关
+  lora_rank: 16
+  heatmap_sigma: 8.0
+  loss_weight_factor: 30.0
+  use_focal_loss: false
+
+controlnet:
+  # 指向你已训练好的 ControlNet 目录（包含 model_index.json 等）
+  path: "output/controlnet/controlnet"
+
+

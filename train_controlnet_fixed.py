@@ -25,18 +25,97 @@ def find_latest_checkpoint(output_dir):
     checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[-1]))
     return checkpoints[-1] if checkpoints else None
 
+def compute_improved_weighted_loss(model_pred, noise, conditioning_heatmap, weight_factor=50.0, use_focal=False):
+    """
+    改进的加权Loss函数 - 修复3个关键问题
+    
+    核心改进：
+    1. 使用Max Pooling下采样（保持峰值强度）
+    2. 二值化权重（目标区域极高权重，背景标准权重）
+    3. 可选：Focal Loss机制（关注难学习的区域）
+    
+    Args:
+        model_pred: UNet预测的噪声 [B, 4, 64, 64]
+        noise: 真实噪声 [B, 4, 64, 64]
+        conditioning_heatmap: 热力图条件 [B, 3, 512, 512]
+        weight_factor: 目标区域的权重倍数
+        use_focal: 是否使用Focal Loss机制
+    
+    Returns:
+        weighted_loss: 加权后的损失
+        stats: 统计信息
+    """
+    # 1. 基础MSE损失（逐像素）
+    base_loss = F.mse_loss(model_pred.float(), noise.float(), reduction="none")  # [B, 4, 64, 64]
+    
+    # 2. 生成权重图 - 使用Max Pooling保持峰值
+    heatmap_gray = conditioning_heatmap.mean(dim=1, keepdim=True)  # [B, 1, 512, 512]
+    
+    # 🔴 关键改进1：使用Max Pooling代替Bilinear（保持峰值强度）
+    # 512 -> 64 需要下采样8倍，使用kernel_size=8, stride=8
+    weight_map = F.max_pool2d(heatmap_gray, kernel_size=8, stride=8)  # [B, 1, 64, 64]
+    
+    # 🔴 关键改进2：二值化权重（目标/背景明确区分）
+    # 阈值选择：热图值>0.1认为是目标区域
+    target_mask = (weight_map > 0.1).float()  # [B, 1, 64, 64]
+    
+    # 目标区域：weight_factor倍权重；背景区域：1倍权重
+    weight_map = torch.where(
+        target_mask > 0.5,
+        torch.full_like(weight_map, float(weight_factor)),  # 目标区域
+        torch.ones_like(weight_map)  # 背景区域
+    )
+    
+    # 🔴 关键改进3（可选）：Focal Loss - 给难学习的样本更高权重
+    if use_focal:
+        # Focal loss: 给高loss的区域更高权重（模型还没学好的地方）
+        focal_weight = torch.pow(base_loss.detach() / base_loss.detach().mean(), 0.5)
+        weight_map = weight_map * (0.5 + 0.5 * focal_weight.mean(dim=1, keepdim=True))
+    
+    # 4. 应用权重（扩展到4个通道）
+    weight_map = weight_map.expand_as(base_loss)  # [B, 4, 64, 64]
+    weighted_loss = (base_loss * weight_map).sum() / weight_map.sum()  # 加权平均
+    
+    # 5. 计算统计信息（用于监控）
+    with torch.no_grad():
+        base_loss_mean = base_loss.mean().item()
+        weight_mean = weight_map.mean().item()
+        target_ratio = target_mask.mean().item()  # 目标区域占比
+        effective_weight = weight_mean  # 实际平均权重
+        
+        # 计算目标区域和背景区域的loss
+        target_loss = (base_loss * target_mask.expand_as(base_loss)).sum() / (target_mask.sum() * 4 + 1e-6)
+        bg_loss = (base_loss * (1 - target_mask.expand_as(base_loss))).sum() / ((1 - target_mask).sum() * 4 + 1e-6)
+    
+    return weighted_loss, {
+        'base_loss': base_loss_mean,
+        'weight_mean': effective_weight,
+        'target_ratio': target_ratio,
+        'target_loss': target_loss.item(),
+        'bg_loss': bg_loss.item(),
+    }
+
 def main(config_path, resume_from_checkpoint=None):
     config = load_config(config_path)
     proj = config["project"]
     data_cfg = config["data"]
     train_cfg = config["training"]
+    
+    # 从配置中读取参数
+    weight_factor = train_cfg.get("loss_weight_factor", 50.0)
+    use_focal_loss = train_cfg.get("use_focal_loss", False)
+    print(f"🎯 使用改进的加权Loss")
+    print(f"   - 权重因子: {weight_factor}x")
+    print(f"   - Max Pooling下采样（保持峰值）")
+    print(f"   - 二值化权重（目标{weight_factor}x，背景1x）")
+    print(f"   - Focal Loss: {'启用' if use_focal_loss else '禁用'}")
 
     accelerator = Accelerator(
         gradient_accumulation_steps=train_cfg["gradient_accumulation_steps"],
         mixed_precision=train_cfg["mixed_precision"],
     )
     
-    # 初始化TensorBoard（静默，完全不影响训练）
+    # 初始化TensorBoard
     writer = None
     if accelerator.is_main_process:
         try:
@@ -46,6 +125,7 @@ def main(config_path, resume_from_checkpoint=None):
         except Exception:
             writer = None
 
+    print("📥 加载预训练模型...")
     tokenizer = CLIPTokenizer.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="text_encoder")
     vae = AutoencoderKL.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="vae")
@@ -53,12 +133,14 @@ def main(config_path, resume_from_checkpoint=None):
     controlnet = ControlNetModel.from_unet(unet)
     noise_scheduler = DDPMScheduler.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="scheduler")
 
+    # 启用xformers（如果可用）
     try:
         import xformers
         unet.enable_xformers_memory_efficient_attention()
         controlnet.enable_xformers_memory_efficient_attention()
+        print("✅ 启用 xformers 内存优化")
     except ImportError:
-        pass
+        print("⚠️  xformers 未安装，使用标准注意力机制")
 
     vae = vae.to(accelerator.device)
     text_encoder = text_encoder.to(accelerator.device)
@@ -69,14 +151,26 @@ def main(config_path, resume_from_checkpoint=None):
     text_encoder.requires_grad_(False)
     controlnet.train()
 
-    optimizer = torch.optim.AdamW(controlnet.parameters(), lr=train_cfg["learning_rate"])
+    # 兼容字符串或数字形式的学习率配置（例如 "1e-5" 或 1e-5）
+    lr_raw = train_cfg.get("learning_rate", train_cfg.get("lr", 1e-5))
+    try:
+        learning_rate = float(lr_raw)
+    except Exception:
+        raise ValueError(f"training.learning_rate 必须是数值，当前为: {lr_raw!r}")
 
+    optimizer = torch.optim.AdamW(controlnet.parameters(), lr=learning_rate)
+
+    # 从配置读取sigma参数
+    heatmap_sigma = train_cfg.get("heatmap_sigma", 15.0)
+    print(f"🎯 热力图Sigma: {heatmap_sigma}")
+    
     dataset = RadarControlNetDataset(
         data_dir=data_cfg["data_dir"],
         tokenizer=tokenizer,
         size=data_cfg["resolution"],
         range_max=data_cfg["range_max"],
-        vel_max=data_cfg["vel_max"]
+        vel_max=data_cfg["vel_max"],
+        heatmap_sigma=heatmap_sigma
     )
     train_dataloader = DataLoader(
         dataset,
@@ -93,8 +187,8 @@ def main(config_path, resume_from_checkpoint=None):
     num_update_steps_per_epoch = len(train_dataloader) // train_cfg["gradient_accumulation_steps"]
     max_train_steps = train_cfg["num_train_epochs"] * num_update_steps_per_epoch
 
-    # 创建学习率调度器（支持 constant 和 cosine）
-    print(f"📊 使用学习率调度器: {train_cfg['lr_scheduler']}")
+    # 创建学习率调度器
+    print(f"📊 学习率调度器: {train_cfg['lr_scheduler']}")
     lr_scheduler = get_scheduler(
         train_cfg["lr_scheduler"],
         optimizer=optimizer,
@@ -104,33 +198,28 @@ def main(config_path, resume_from_checkpoint=None):
 
     # 检查是否需要恢复训练
     if resume_from_checkpoint == "none":
-        # 强制从头开始训练
         print("🆕 强制从头开始训练（--from_scratch）")
         resume_from_checkpoint = None
     elif resume_from_checkpoint is None:
-        # 自动查找最新的 checkpoint
         resume_from_checkpoint = find_latest_checkpoint(proj["output_dir"])
         if resume_from_checkpoint:
             print(f"🔍 自动发现最新 checkpoint: {resume_from_checkpoint}")
     else:
-        # 使用指定的 checkpoint
         print(f"📌 使用指定 checkpoint: {resume_from_checkpoint}")
 
-    # 先 prepare 所有组件，再加载 checkpoint（避免混合精度训练的状态问题）
+    # Prepare所有组件
     print("🔧 Preparing models with Accelerator...")
     controlnet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         controlnet, optimizer, train_dataloader, lr_scheduler
     )
 
-    # 如果有 checkpoint，加载模型权重和训练状态
+    # 如果有checkpoint，加载模型权重和训练状态
     if resume_from_checkpoint:
         print(f"🔄 从 checkpoint 恢复: {resume_from_checkpoint}")
         
-        # 加载 ControlNet 权重
         controlnet_state = ControlNetModel.from_pretrained(resume_from_checkpoint)
         accelerator.unwrap_model(controlnet).load_state_dict(controlnet_state.state_dict())
         
-        # 加载训练状态
         trainer_state_path = os.path.join(resume_from_checkpoint, "trainer_state.yaml")
         if os.path.exists(trainer_state_path):
             with open(trainer_state_path, 'r') as f:
@@ -139,7 +228,6 @@ def main(config_path, resume_from_checkpoint=None):
             global_step = trainer_state.get("global_step", 0)
             resume_step = trainer_state.get("resume_step", 0)
             
-            # 🔴 关键修复：如果resume_step为0，说明上个epoch已完成，应该从下一个epoch开始
             if resume_step == 0:
                 starting_epoch += 1
                 print(f"✅ 恢复状态: 已完成 {starting_epoch} 个epoch，从 Epoch {starting_epoch + 1} 继续训练")
@@ -147,19 +235,23 @@ def main(config_path, resume_from_checkpoint=None):
                 print(f"✅ 恢复状态: 从 Epoch {starting_epoch + 1} 第 {resume_step} 步继续训练")
         else:
             print(f"⚠️  未找到训练状态文件，从 Epoch 1 开始")
-        
-        print(f"⚠️  注意: optimizer 和 scheduler 状态重置，从当前学习率继续")
     else:
         print("🆕 从头开始训练")
 
     num_update_steps_per_epoch = len(train_dataloader) // train_cfg["gradient_accumulation_steps"]
-    total_steps = train_cfg["num_train_epochs"] * num_update_steps_per_epoch
 
     total_start_time = time.time()
     
+    print("\n" + "="*60)
+    print("🚀 开始训练")
+    print("="*60)
+    
     for epoch in range(starting_epoch, train_cfg["num_train_epochs"]):
         epoch_start_time = time.time()
-        epoch_loss = 0.0
+        epoch_weighted_loss = 0.0
+        epoch_base_loss = 0.0
+        epoch_target_loss = 0.0
+        epoch_bg_loss = 0.0
         num_batches = 0
         
         if resume_step > 0:
@@ -200,7 +292,14 @@ def main(config_path, resume_from_checkpoint=None):
                     mid_block_additional_residual=mid_block_res_sample,
                 ).sample
 
-                loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+                # 🔴 使用改进的加权Loss函数
+                loss, loss_stats = compute_improved_weighted_loss(
+                    model_pred, 
+                    noise, 
+                    batch["conditioning_pixel_values"],
+                    weight_factor=weight_factor,
+                    use_focal=use_focal_loss
+                )
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -210,30 +309,44 @@ def main(config_path, resume_from_checkpoint=None):
                 optimizer.zero_grad()
 
                 if accelerator.sync_gradients:
-                    epoch_loss += loss.item()
+                    epoch_weighted_loss += loss.item()
+                    epoch_base_loss += loss_stats['base_loss']
+                    epoch_target_loss += loss_stats['target_loss']
+                    epoch_bg_loss += loss_stats['bg_loss']
                     num_batches += 1
                     global_step += 1
                     
-                    avg_loss = epoch_loss / num_batches
+                    avg_weighted_loss = epoch_weighted_loss / num_batches
+                    avg_base_loss = epoch_base_loss / num_batches
                     
-                    # 🔴 记录到TensorBoard（每个step）
+                    # 记录到TensorBoard
                     if writer is not None:
                         try:
-                            writer.add_scalar('Loss/train_loss_step', loss.item(), global_step)
+                            writer.add_scalar('Loss/weighted_loss', loss.item(), global_step)
+                            writer.add_scalar('Loss/base_loss', loss_stats['base_loss'], global_step)
+                            writer.add_scalar('Loss/target_loss', loss_stats['target_loss'], global_step)
+                            writer.add_scalar('Loss/bg_loss', loss_stats['bg_loss'], global_step)
+                            writer.add_scalar('Loss/weight_mean', loss_stats['weight_mean'], global_step)
+                            writer.add_scalar('Loss/target_ratio', loss_stats['target_ratio'], global_step)
                             writer.add_scalar('Training/learning_rate', optimizer.param_groups[0]['lr'], global_step)
                         except Exception:
-                            pass  # 忽略TensorBoard错误
+                            pass
                     
-                    progress_bar.set_postfix({"loss": f"{avg_loss:.4f}"})
+                    # 显示训练进度
+                    progress_bar.set_postfix({
+                        "w_loss": f"{avg_weighted_loss:.4f}",
+                        "base": f"{avg_base_loss:.4f}",
+                        "t_loss": f"{loss_stats['target_loss']:.4f}",
+                        "bg": f"{loss_stats['bg_loss']:.4f}"
+                    })
                     progress_bar.update(1)
                     
+                    # 定期保存checkpoint
                     if global_step % train_cfg["save_steps"] == 0:
                         if accelerator.is_main_process:
                             save_path = os.path.join(proj["output_dir"], f"checkpoint-{global_step}")
                             os.makedirs(save_path, exist_ok=True)
                             accelerator.unwrap_model(controlnet).save_pretrained(save_path)
-                            # torch.save(optimizer.state_dict(), os.path.join(save_path, "optimizer.bin"))  # 不保存 optimizer
-                            # torch.save(lr_scheduler, os.path.join(save_path, "scheduler.bin"))  # 不保存 scheduler
                             trainer_state = {
                                 "epoch": epoch,
                                 "global_step": global_step,
@@ -245,75 +358,81 @@ def main(config_path, resume_from_checkpoint=None):
         progress_bar.close()
         
         epoch_time = time.time() - epoch_start_time
-        avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0
+        avg_weighted_loss = epoch_weighted_loss / num_batches if num_batches > 0 else 0
+        avg_base_loss = epoch_base_loss / num_batches if num_batches > 0 else 0
+        avg_target_loss = epoch_target_loss / num_batches if num_batches > 0 else 0
+        avg_bg_loss = epoch_bg_loss / num_batches if num_batches > 0 else 0
         
         elapsed_total = time.time() - total_start_time
         epochs_done = epoch + 1 - starting_epoch
         epochs_left = train_cfg["num_train_epochs"] - (epoch + 1)
         avg_epoch_time = elapsed_total / epochs_done if epochs_done > 0 else 0
         total_eta = avg_epoch_time * epochs_left
-        epoch_eta = avg_epoch_time
         
-        # 🔴 记录到TensorBoard（每个epoch）
+        # 记录epoch级别的指标
         if writer is not None:
             try:
-                writer.add_scalar('Loss/train_loss_epoch', avg_epoch_loss, epoch + 1)
+                writer.add_scalar('Loss/weighted_loss_epoch', avg_weighted_loss, epoch + 1)
+                writer.add_scalar('Loss/base_loss_epoch', avg_base_loss, epoch + 1)
+                writer.add_scalar('Loss/target_loss_epoch', avg_target_loss, epoch + 1)
+                writer.add_scalar('Loss/bg_loss_epoch', avg_bg_loss, epoch + 1)
                 writer.add_scalar('Training/epoch_time_minutes', epoch_time / 60, epoch + 1)
                 writer.add_scalar('Training/samples_per_second', len(dataset) / epoch_time, epoch + 1)
                 writer.add_scalar('Training/learning_rate_epoch', optimizer.param_groups[0]['lr'], epoch + 1)
             except Exception:
-                pass  # 忽略TensorBoard错误
+                pass
         
-        print(f"✅ Epoch {epoch + 1} finished | "
-              f"Avg Loss: {avg_epoch_loss:.4f} | "
-              f"Time: {epoch_time/60:.1f}m | "
-              f"Epoch ETA: {epoch_eta/60:.1f}m | "
-              f"Total ETA: {total_eta/60:.1f}m")
+        print(f"\n✅ Epoch {epoch + 1} 完成:")
+        print(f"   Weighted Loss: {avg_weighted_loss:.4f}")
+        print(f"   Base Loss: {avg_base_loss:.4f}")
+        print(f"   Target Loss: {avg_target_loss:.4f} | BG Loss: {avg_bg_loss:.4f}")
+        print(f"   用时: {epoch_time/60:.1f}分钟 | 总ETA: {total_eta/60:.1f}分钟")
         
-        # 在每个epoch结束后保存checkpoint（可选，但推荐）
-        if accelerator.is_main_process and (epoch + 1) % 5 == 0:  # 每5个epoch保存一次
+        # 每5个epoch保存checkpoint
+        if accelerator.is_main_process and (epoch + 1) % 5 == 0:
             save_path = os.path.join(proj["output_dir"], f"checkpoint-epoch-{epoch + 1}")
             os.makedirs(save_path, exist_ok=True)
             accelerator.unwrap_model(controlnet).save_pretrained(save_path)
             trainer_state = {
-                "epoch": epoch,  # 当前epoch编号（0-based）
+                "epoch": epoch,
                 "global_step": global_step,
-                "resume_step": 0  # 0表示该epoch已完成
+                "resume_step": 0
             }
             with open(os.path.join(save_path, "trainer_state.yaml"), 'w') as f:
                 yaml.dump(trainer_state, f)
             print(f"💾 Checkpoint saved: {save_path}")
 
+    # 保存最终模型
     if accelerator.is_main_process:
         save_path = os.path.join(proj["output_dir"], "controlnet")
         accelerator.unwrap_model(controlnet).save_pretrained(save_path)
         
-        # 关闭TensorBoard writer（静默）
         if writer is not None:
             try:
                 writer.close()
             except Exception:
                 pass
         
-        print(f"🎉 训练完成！模型保存至: {save_path}")
+        print(f"\n🎉 训练完成！模型保存至: {save_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="雷达 RD 图 ControlNet 训练")
+    parser = argparse.ArgumentParser(description="雷达 RD 图 ControlNet 训练（改进Loss版本）")
     parser.add_argument("--config", type=str, default="config.yaml",
                         help="配置文件路径")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
-                        help="指定 checkpoint 路径，如: output/controlnet/checkpoint-1000")
+                        help="指定 checkpoint 路径")
     parser.add_argument("--from_scratch", action="store_true",
-                        help="强制从头开始训练，忽略所有已有的 checkpoint")
+                        help="强制从头开始训练")
     args = parser.parse_args()
 
     os.makedirs("output", exist_ok=True)
     
-    # 处理训练模式
     if args.from_scratch:
         print("⚡ 强制从头开始训练模式")
-        resume_checkpoint = "none"  # 特殊标记，表示不恢复
+        resume_checkpoint = "none"
     else:
         resume_checkpoint = args.resume_from_checkpoint
     
     main(args.config, resume_checkpoint)
+
+

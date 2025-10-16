@@ -1,0 +1,1 @@
+target number = 2, the first target: distance = 143m, velocity = -20.00m/s. the second target: distance = 80m, velocity = 5.00m/s. The background color is blue.

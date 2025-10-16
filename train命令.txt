@@ -1,0 +1,9 @@
+export HF_ENDPOINT=https://hf-mirror.com
+python train.py --config config.yaml
+
+
+python inference.py \
+  --controlnet_path output/controlnet/controlnet \
+  --prompt_file test_prompt_example.txt \
+  --output_dir results_final \
+  --batch_size 4
