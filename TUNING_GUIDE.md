@@ -83,3 +83,19 @@
 - LoRA 是否过强（调低 `lora_scale`）？
 
 祝你训练顺利！
+
+---
+
+## 9. 采样器 / 调度器建议（KSampler）
+- 优先级（RD 图、ControlNet+LoRA 场景）：
+  - DPM++ 2M Karras：画质/锐度最好、收敛稳，步数 35–45
+  - DPM++ SDE Karras：细节更强，步数 35–45（略慢）
+  - Euler a：速度快、位置稳定，步数 28–36
+  - DDIM：基准稳定，步数 30–40
+- 其余推荐：
+  - CFG：3–5
+  - controlnet_conditioning_scale：1.1–1.3
+  - lora_scale：0.6–0.8
+- 小贴士：
+  - 边缘/十字仍偏糊 → 在当前调度器上先加 5–10 步；不够再切换到 DPM++ 2M Karras。
+  - 速度优先 → Euler a + 28–32 步。

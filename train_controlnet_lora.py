@@ -8,7 +8,11 @@ from accelerate import Accelerator
 from diffusers import ControlNetModel, AutoencoderKL, UNet2DConditionModel, DDPMScheduler
 from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers.optimization import get_scheduler
-from diffusers.models.attention_processor import LoRAAttnProcessor, AttnProcsLayers
+try:
+    from diffusers.models.attention_processor import LoRAAttnProcessor
+except Exception:
+    # 兼容部分版本：LoRAAttnProcessor2_0
+    from diffusers.models.attention_processor import LoRAAttnProcessor2_0 as LoRAAttnProcessor
 from tqdm.auto import tqdm
 from dataset import RadarControlNetDataset
 import argparse
@@ -80,10 +84,9 @@ def compute_improved_weighted_loss(model_pred, noise, conditioning_heatmap, weig
     }
 
 
-def add_unet_lora_layers(unet: UNet2DConditionModel, rank: int = 16) -> AttnProcsLayers:
+def add_unet_lora_layers(unet: UNet2DConditionModel, rank: int = 16):
     """
-    给 UNet 注入 LoRA 注意力处理器，仅返回可训练的 LoRA 层集合。
-    参考 diffusers 示例：按模块名推断 hidden_size / cross_attention_dim。
+    给 UNet 注入 LoRA 注意力处理器，并返回可训练的 LoRA 参数列表（兼容不含 AttnProcsLayers 的 diffusers 版本）。
     """
     lora_attn_procs = {}
     for name in unet.attn_processors.keys():
@@ -99,7 +102,6 @@ def add_unet_lora_layers(unet: UNet2DConditionModel, rank: int = 16) -> AttnProc
             block_id = int(name[len("down_blocks."):].split(".")[0])
             hidden_size = unet.config.block_out_channels[block_id]
         else:
-            # 兜底：使用最后一层通道数
             hidden_size = unet.config.block_out_channels[-1]
 
         lora_attn_procs[name] = LoRAAttnProcessor(
@@ -109,11 +111,16 @@ def add_unet_lora_layers(unet: UNet2DConditionModel, rank: int = 16) -> AttnProc
         )
 
     unet.set_attn_processor(lora_attn_procs)
-    lora_layers = AttnProcsLayers(unet.attn_processors)
-    # 仅 LoRA 参数参与训练
-    for p in lora_layers.parameters():
-        p.requires_grad_(True)
-    return lora_layers
+
+    # 收集可训练的 LoRA 参数
+    lora_parameters = []
+    for module in unet.attn_processors.values():
+        if hasattr(module, 'parameters'):
+            for p in module.parameters():
+                p.requires_grad_(True)
+                lora_parameters.append(p)
+
+    return lora_parameters
 
 
 def main(config_path, resume_from_checkpoint=None):
@@ -181,7 +188,7 @@ def main(config_path, resume_from_checkpoint=None):
     controlnet.requires_grad_(False)
 
     # 注入 LoRA，仅 LoRA 训练
-    lora_layers = add_unet_lora_layers(unet, rank=lora_rank)
+    lora_parameters = add_unet_lora_layers(unet, rank=lora_rank)
     unet.train()
 
     # 学习率与优化器
@@ -191,7 +198,7 @@ def main(config_path, resume_from_checkpoint=None):
     except Exception:
         raise ValueError(f"training.learning_rate 必须是数值，当前为: {lr_raw!r}")
 
-    optimizer = torch.optim.AdamW(lora_layers.parameters(), lr=learning_rate)
+    optimizer = torch.optim.AdamW(lora_parameters, lr=learning_rate)
 
     # 数据集
     dataset = RadarControlNetDataset(
@@ -290,7 +297,7 @@ def main(config_path, resume_from_checkpoint=None):
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(lora_layers.parameters(), train_cfg["max_grad_norm"])
+                    accelerator.clip_grad_norm_(lora_parameters, train_cfg["max_grad_norm"])
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()

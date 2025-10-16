@@ -4,7 +4,7 @@ dataset/
 # 忽略输出目录
 output/
 
-heatmap/
+heatmap*/
 
 __pycache__/
 
@@ -12,3 +12,5 @@ results*/
 
 **/logs/
 *./log
+
+new_data/
