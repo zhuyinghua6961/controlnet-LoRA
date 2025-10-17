@@ -75,6 +75,24 @@ python train_controlnet_lora.py --config config_lora.yaml
 
 ---
 
+## 2.5 两阶段 + 轻联合训练（推荐进阶）
+
+当你希望在定位已稳定的前提下进一步增强画质，可使用“两阶段+轻联合”脚本：
+
+```bash
+python train_joint_lora_controlnet.py --config config_joint.yaml
+# 最终保存：output/joint_lora_cn/final/controlnet/ 与 output/joint_lora_cn/final/lora/
+```
+
+配置示例：`config_joint.yaml`（包含 stage1/2）
+- 阶段1：仅训 ControlNet（定位优先），如 `loss_weight_factor: 100`, `heatmap_sigma: 8.0`
+- 阶段2：ControlNet + UNet LoRA 联合（小 lr 微调画质），如 `lora_learning_rate: 5e-5`, `loss_weight_factor: 60`
+
+建议：
+- 数据量 3000–4000 张时，阶段1 40–80 epoch（或按你经验 80–100 更稳，配合早停）；阶段2 3–10 epoch（可按需追加）
+
+---
+
 ## 3. 推理（支持是否加载 LoRA）
 
 脚本：`inference_lora.py`
@@ -125,14 +143,30 @@ python train_full_pipeline.py --controlnet_config config.yaml --lora_config conf
 
 ---
 
-## 5. 小贴士（画质与精度兼顾）
+## 5. 早停与梯度累计（强烈推荐）
+
+- 梯度累计
+  - 通过配置 `training.gradient_accumulation_steps` 设置（LoRA 与联合脚本均已内置，使用 accelerate 管理）；有效 batch = `train_batch_size × gradient_accumulation_steps`
+- 早停（防止过训、节省时间）
+  - 在配置中开启：
+    ```yaml
+    early_stopping:
+      enabled: true
+      patience: 5        # 连续若干 epoch 无明显改进则停止
+      min_delta: 0.0     # 认为“有改进”的最小幅度
+    ```
+  - 监控指标为 `weighted_loss_epoch`（训练集均值）。如需更严格，可替换为验证集指标（可扩展）。
+
+---
+
+## 6. 小贴士（画质与精度兼顾）
 - 位置已稳时，LoRA 主要提升画质；若定位轻微受影响，降低 `lora_scale`（如 0.5–0.6）。
 - 训练/推理的 `sigma` 要一致（建议 8.0）。
 - 推理建议：steps 30–50、CFG 3–5、controlnet_conditioning_scale 1.0–1.3。
 
 ---
 
-## 6. 产物与日志位置
+## 7. 产物与日志位置
 - ControlNet 最终模型：`output/controlnet/controlnet/`
 - LoRA 最终权重：`output/controlnet_lora/lora/`
 - 日志：各自目录下 `logs/`

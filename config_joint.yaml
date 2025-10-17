@@ -1,0 +1,53 @@
+project:
+  name: "radar_joint_lora_cn"
+  output_dir: "output/joint_lora_cn"
+
+data:
+  data_dir: "dataset"
+  resolution: 512
+  range_max: 200
+  vel_max: 40
+
+stage1:  # 定位优先：仅 ControlNet
+  training:
+    train_batch_size: 2
+    gradient_accumulation_steps: 4
+    num_train_epochs: 5
+    learning_rate: 1.0e-6
+    lr_scheduler: "cosine"
+    lr_warmup_steps: 1000
+    max_grad_norm: 1.0
+    mixed_precision: "fp16"
+    dataloader_num_workers: 4
+    save_steps: 2500
+    heatmap_sigma: 8.0
+    loss_weight_factor: 100.0
+    use_focal_loss: false
+    early_stopping:
+      enabled: true
+      patience: 5
+      min_delta: 0.0
+
+stage2:  # 轻联合：ControlNet + UNet LoRA
+  training:
+    train_batch_size: 2
+    gradient_accumulation_steps: 4
+    num_train_epochs: 5
+    learning_rate: 1.0e-6          # ControlNet LR（小）
+    lora_learning_rate: 5.0e-5     # LoRA LR（相对大）
+    lr_scheduler: "cosine"
+    lr_warmup_steps: 500
+    max_grad_norm: 1.0
+    mixed_precision: "fp16"
+    dataloader_num_workers: 4
+    save_steps: 2500
+    heatmap_sigma: 8.0
+    loss_weight_factor: 60.0
+    use_focal_loss: false
+    lora_rank: 16
+    early_stopping:
+      enabled: true
+      patience: 5
+      min_delta: 0.0
+
+
